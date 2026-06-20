@@ -1,0 +1,7 @@
+python-telegram-bot==20.*
+requests==2.*
+Pillow==10.*
+exif==1.*
+patool==2.*
+yt-dlp==2024.*
+myjdapi
