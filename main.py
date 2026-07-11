@@ -20,6 +20,7 @@ from telegram.error import RetryAfter, TelegramError
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
 from telethon.tl.types import DocumentAttributeFilename
 from telethon import TelegramClient
+from telegram.request import HTTPXRequest
 
 # Telethon config
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -546,9 +547,61 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_obj = await msg.photo[-1].get_file(); fname = f"photo_{file_obj.file_unique_id}.jpg"
     elif msg.video:
         file_obj = await msg.video.get_file(); fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
-    elif msg.video_note:  # <-- ДОБАВИТЬ ЭТО
-        file_obj = await msg.video_note.get_file()
-        fname = f"video_note_{file_obj.file_unique_id}.mp4"
+#    elif msg.video_note:  # <-- ДОБАВИТЬ ЭТО
+#        file_obj = await msg.video_note.get_file()
+#        fname = f"video_note_{file_obj.file_unique_id}.mp4"
+    elif msg.video_note:
+        file_size = msg.video_note.file_size or 0
+        
+        # Если видеосообщение большое (>20МБ) и Telethon настроен — используем его
+        if file_size > 20 * 1024 * 1024 and telethon_client:
+            job_dir = os.path.join(TEMP_DIR, f"vnote_{msg.message_id}")
+            os.makedirs(job_dir, exist_ok=True)
+            fname = f"video_note_{msg.video_note.file_unique_id}.mp4"
+            dest_path = os.path.join(job_dir, fname)
+            
+            sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
+            
+            try:
+                telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
+                await telethon_client.download_media(telethon_msg, file=dest_path)
+                
+                # Загружаем в Immich как обычное видео
+                status, _ = await upload_file_path_to_immich(
+                    dest_path, fname, msg.date, msg.message_id,
+                    extra_album=tags[0] if tags and tags[0] else None,
+                    fotografo=tags[1] if tags and len(tags) > 1 else None
+                )
+                
+                shutil.rmtree(job_dir)
+                
+                report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=report, parse_mode="HTML")
+                return
+                
+            except Exception as e:
+                logging.error(f"Telethon video_note download error: {e}")
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
+                shutil.rmtree(job_dir, ignore_errors=True)
+                return
+        
+        # Стандартное скачивание через Bot API с повторными попытками
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                file_obj = await msg.video_note.get_file()
+                fname = f"video_note_{file_obj.file_unique_id}.mp4"
+                break
+            except TelegramError as e:
+                if "timed out" in str(e).lower() and attempt < max_retries - 1:
+                    logging.warning(f"Таймаут при скачивании video_note, попытка {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    logging.error(f"Ошибка скачивания video_note: {e}")
+                    await msg.reply_text(f"❌ Не удалось скачать видеосообщение: {e}")
+                    return
+####end new block
     if file_obj:
         if fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
             job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
@@ -608,6 +661,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
 if __name__ == "__main__":
+    # Увеличиваем таймауты для работы с большими файлами
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30.0,  # Увеличиваем до 30 секунд
+        write_timeout=30.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0
+    )
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("tags", send_tags_menu))
     app.add_handler(CommandHandler("start", send_tags_menu))
