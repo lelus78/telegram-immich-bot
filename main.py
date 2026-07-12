@@ -23,8 +23,9 @@ from telethon import TelegramClient
 from telegram.request import HTTPXRequest
 import fcntl
 import signal
+import sys
 
-# Lock file для координации между контейнерами
+# --- LOCK FILE ДЛЯ ACTIVE-PASSIVE РЕЖИМА ---
 LOCK_FILE = os.path.join(os.getenv("IMPORT_DIR", ""), "bot.lock")
 lock_fd = None
 
@@ -52,7 +53,8 @@ def release_lock():
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
-            os.remove(LOCK_FILE)
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
             logging.info("🔓 Блокировка освобождена")
         except:
             pass
@@ -68,33 +70,34 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
+# Пытаемся захватить блокировку СРАЗУ после определения констант
+if not acquire_lock():
+    logging.error("❌ Другой экземпляр бота уже активен. Завершаю работу.")
+    sys.exit(1)
 
 # Telethon config
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
-# Инициализация клиента Telethon
+# Инициализация клиента Telethon (только если блокировка получена)
 telethon_client = None
 if API_ID and API_HASH:
     logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
     
-    # Проверяем существование файла сессии
     session_file = f"{SESSION_NAME}.session"
     if not os.path.exists(session_file):
-        logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
+        logging.error(f"❌ Файл сессии '{session_file}' не найден!")
     else:
         try:
             telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
             
             async def init_telethon():
-                # Сначала подключаемся
                 await telethon_client.connect()
                 logging.info("✅ Telethon подключен")
                 
-                # Потом проверяем авторизацию
                 if not await telethon_client.is_user_authorized():
-                    logging.error("❌ Telethon не авторизован! Файл сессии недействителен.")
+                    logging.error("❌ Telethon не авторизован!")
                     await telethon_client.disconnect()
                     return None
                 
