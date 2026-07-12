@@ -10,6 +10,7 @@ import subprocess
 import myjdapi
 import json
 import hashlib
+import uuid
 from datetime import datetime
 from collections import defaultdict
 from io import BytesIO
@@ -32,7 +33,6 @@ telethon_client = None
 if API_ID and API_HASH:
     logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
     
-    # Проверяем существование файла сессии
     session_file = f"{SESSION_NAME}.session"
     if not os.path.exists(session_file):
         logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
@@ -41,16 +41,12 @@ if API_ID and API_HASH:
             telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
             
             async def init_telethon():
-                # Сначала подключаемся
                 await telethon_client.connect()
                 logging.info("✅ Telethon подключен")
-                
-                # Потом проверяем авторизацию
                 if not await telethon_client.is_user_authorized():
                     logging.error("❌ Telethon не авторизован! Файл сессии недействителен.")
                     await telethon_client.disconnect()
                     return None
-                
                 logging.info("✅ Telethon авторизован и готов к работе")
                 return telethon_client
             
@@ -62,7 +58,6 @@ if API_ID and API_HASH:
             telethon_client = None
 else:
     logging.warning("⚠️ TELEGRAM_API_ID или TELEGRAM_API_HASH не заданы")
-
 
 # --- CONFIGURAZIONE ---
 logging.basicConfig(
@@ -93,8 +88,70 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 ALBUM_CACHE = {}
 USER_TAGS_MEM = {}
 
+# --- ACTIVE-PASSIVE LOCK CONFIG ---
+LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "/shared_storage/bot.lock")
+INSTANCE_ID = os.getenv("HOSTNAME", str(uuid.uuid4()))
+LOCK_TIMEOUT = int(os.getenv("LOCK_TIMEOUT", "30"))
+LOCK_CHECK_INTERVAL = int(os.getenv("LOCK_CHECK_INTERVAL", "10"))
+
 if not all([TOKEN, IMMICH_URL, API_KEY]):
     logging.error("Variabili d\'ambiente mancanti!"); exit(1)
+
+# --- LOCK MECHANISM ---
+def try_acquire_lock(lock_path, instance_id, timeout):
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        # Пытаемся атомарно создать файл
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, 'w') as f:
+            json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
+        return True
+    except FileExistsError:
+        # Файл существует, проверяем, не "протух" ли он
+        try:
+            with open(lock_path, 'r') as f:
+                data = json.load(f)
+            if time.time() - data.get("last_heartbeat", 0) > timeout:
+                # Блокировка старая, перехватываем
+                with open(lock_path, 'w') as f:
+                    json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
+                return True
+            return False
+        except Exception:
+            # Если файл поврежден, пытаемся перезаписать
+            try:
+                with open(lock_path, 'w') as f:
+                    json.dump({"instance_id": instance_id, "last_heartbeat": time.time()}, f)
+                return True
+            except Exception:
+                return False
+    except Exception as e:
+        logging.error(f"Lock acquisition error: {e}")
+        return False
+
+def maintain_lock(lock_path, instance_id):
+    try:
+        with open(lock_path, 'r') as f:
+            data = json.load(f)
+        if data.get("instance_id") == instance_id:
+            data["last_heartbeat"] = time.time()
+            with open(lock_path, 'w') as f:
+                json.dump(data, f)
+            return True
+    except Exception as e:
+        logging.warning(f"Lock maintenance error: {e}")
+    return False
+
+def release_lock(lock_path, instance_id):
+    try:
+        if os.path.exists(lock_path):
+            with open(lock_path, 'r') as f:
+                data = json.load(f)
+            if data.get("instance_id") == instance_id:
+                os.remove(lock_path)
+                logging.info("🔓 Lock released.")
+    except Exception as e:
+        logging.warning(f"Lock release error: {e}")
 
 # --- UTILS ---
 def fix_perms(path):
@@ -266,24 +323,16 @@ async def upload_file_path_to_immich(file_path, original_name, telegram_date, me
         
         if not asset_id: return status, None
 
-        # 1. Aggiornamento Descrizione (Fotografo)
         if fotografo:
             try:
                 requests.put(f"{IMMICH_URL}/api/assets/{asset_id}", headers=headers, json={"description": f"Fotografo: {fotografo}"})
             except Exception as e: logging.error(f"Desc upd error: {e}")
 
-        # 2. Gestione Album Multipli (Album Principale + Album Specifiico + Album Fotografo)
         target_ids = []
-        
-        # A. Album Generale (Importate Bot)
         if ALBUM_ID: target_ids.append(ALBUM_ID)
-        
-        # B. Album Specifico (#album)
         if extra_album:
             aid = get_or_create_album(extra_album)
             if aid: target_ids.append(aid)
-            
-        # C. Album Fotografo (#fotografo)
         if fotografo:
             fid = get_or_create_album(fotografo)
             if fid: target_ids.append(fid)
@@ -314,9 +363,7 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
                     ext_to = os.path.join(root, "extracted_" + file)
                     os.makedirs(ext_to, exist_ok=True); fix_perms(ext_to)
                     try: patoolib.extract_archive(full_p, outdir=ext_to); os.remove(full_p); has_archives = True; await asyncio.sleep(5)
-#                    except: total_stats["error"] += 1
                     except Exception as e:
-                        # Теперь вы увидите в логах, почему архив не распаковался
                         logging.error(f"Ошибка распаковки {full_p}: {e}")
                         total_stats["error"] += 1
     all_items = []
@@ -388,33 +435,37 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
 async def watch_folder_task(app):
     special_dirs = ["corrupted", "failed_extraction", "unsupported_files", "tg-immich-bot"]
     while True:
-        await asyncio.sleep(30)
-        if not os.path.exists(IMPORT_DIR): continue
-        items = os.listdir(IMPORT_DIR)
-        relevant = [i for i in items if i not in special_dirs and i != "put_files_here.txt" and i != "bot_history.json"]
-        if not relevant: continue
-        has_valid_content = False
-        for root, dirs, files in os.walk(IMPORT_DIR):
-            dirs[:] = [d for d in dirs if d not in special_dirs]
-            for file in files:
-                if file.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov", ".avi", ".zip", ".rar", ".7z", ".tar", ".webp",
-                                          ".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raw", ".gz")):
-                    if is_file_stable(os.path.join(root, file), wait_time=2):
-                        has_valid_content = True; break
-            if has_valid_content: break
-        if not has_valid_content: continue
-        hist = load_history(); target_chat = hist.get("last_chat_id", ADMIN_ID)
-        if target_chat:
-            try: await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b>", parse_mode="HTML")
-            except: pass
-        stats, albums = await process_directory_content(IMPORT_DIR, datetime.now(), "watchdog", bot=app.bot, chat_id=target_chat)
-        if target_chat and (sum(stats.values()) > 0):
-            report = f"📂 <b>Importazione Completata!</b>\n✅ {stats['success']} Caricati\n♻️ {stats['duplicate']} Duplicati"
-            if albums: report += f"\n📂 <b>Album:</b> {', '.join(albums)}"
-            if stats['unsupported'] > 0: report += f"\n⚠️ {stats['unsupported']} Non supportati"
-            if stats['error'] > 0: report += f"\n❌ {stats['error']} Errori"
-            try: await app.bot.send_message(chat_id=target_chat, text=report, parse_mode="HTML")
-            except: pass
+        try:
+            await asyncio.sleep(30)
+            if not os.path.exists(IMPORT_DIR): continue
+            items = os.listdir(IMPORT_DIR)
+            relevant = [i for i in items if i not in special_dirs and i != "put_files_here.txt" and i != "bot_history.json"]
+            if not relevant: continue
+            has_valid_content = False
+            for root, dirs, files in os.walk(IMPORT_DIR):
+                dirs[:] = [d for d in dirs if d not in special_dirs]
+                for file in files:
+                    if file.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov", ".avi", ".zip", ".rar", ".7z", ".tar", ".webp",
+                                              ".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raw", ".gz")):
+                        if is_file_stable(os.path.join(root, file), wait_time=2):
+                            has_valid_content = True; break
+                if has_valid_content: break
+            if not has_valid_content: continue
+            hist = load_history(); target_chat = hist.get("last_chat_id", ADMIN_ID)
+            if target_chat:
+                try: await app.bot.send_message(chat_id=target_chat, text=f"📂 <b>Importazione Automatica Iniziata!</b>", parse_mode="HTML")
+                except: pass
+            stats, albums = await process_directory_content(IMPORT_DIR, datetime.now(), "watchdog", bot=app.bot, chat_id=target_chat)
+            if target_chat and (sum(stats.values()) > 0):
+                report = f"📂 <b>Importazione Completata!</b>\n✅ {stats['success']} Caricati\n♻️ {stats['duplicate']} Duplicati"
+                if albums: report += f"\n📂 <b>Album:</b> {', '.join(albums)}"
+                if stats['unsupported'] > 0: report += f"\n⚠️ {stats['unsupported']} Non supportati"
+                if stats['error'] > 0: report += f"\n❌ {stats['error']} Errori"
+                try: await app.bot.send_message(chat_id=target_chat, text=report, parse_mode="HTML")
+                except: pass
+        except asyncio.CancelledError:
+            logging.info("Watch folder task cancelled.")
+            break
 
 # --- HANDLERS ---
 async def get_tags_markup(user_id):
@@ -490,22 +541,13 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message; tags = get_effective_tags(update.effective_user.id, msg.caption or "")
     used_albums = [t for t in tags if t] if tags else []
     file_obj = None; fname = "file.jpg"
-#####old part
-#    if msg.document:
-#        fname = msg.document.file_name or "file"
-#        mime = msg.document.mime_type or ""
-#        # Разрешаем скачивание, если это фото/видео ИЛИ архив
-#        if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
-#            file_obj = await msg.document.get_file()
-#####old part
-####new part
+    
     if msg.document:
         fname = msg.document.file_name or "file"
         mime = msg.document.mime_type or ""
         file_size = msg.document.file_size or 0
         
         if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
-            # Если файл больше 20 МБ и Telethon настроен — используем его
             if file_size > 20 * 1024 * 1024 and telethon_client:
                 job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}")
                 os.makedirs(job_dir, exist_ok=True)
@@ -514,26 +556,20 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
                 
                 try:
-                    # Скачиваем файл через Telethon по message_id
                     telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
                     await telethon_client.download_media(telethon_msg, file=dest_path)
-                    
-                    # Дальше обрабатываем как обычный архив
                     stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id)
                     shutil.rmtree(job_dir)
-                    
                     rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
                     if albums: rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
                     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
                     return
-                    
                 except Exception as e:
                     logging.error(f"Telethon download error: {e}")
                     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                     shutil.rmtree(job_dir, ignore_errors=True)
                     return
             
-            # Стандартное скачивание через Bot API (для файлов < 20 МБ)
             try:
                 file_obj = await msg.document.get_file()
             except TelegramError as e:
@@ -542,18 +578,13 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 raise
 
-#####new part
     elif msg.photo:
         file_obj = await msg.photo[-1].get_file(); fname = f"photo_{file_obj.file_unique_id}.jpg"
     elif msg.video:
         file_obj = await msg.video.get_file(); fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
-#    elif msg.video_note:  # <-- ДОБАВИТЬ ЭТО
-#        file_obj = await msg.video_note.get_file()
-#        fname = f"video_note_{file_obj.file_unique_id}.mp4"
     elif msg.video_note:
         file_size = msg.video_note.file_size or 0
         
-        # Если видеосообщение большое (>20МБ) и Telethon настроен — используем его
         if file_size > 20 * 1024 * 1024 and telethon_client:
             job_dir = os.path.join(TEMP_DIR, f"vnote_{msg.message_id}")
             os.makedirs(job_dir, exist_ok=True)
@@ -565,27 +596,21 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
                 await telethon_client.download_media(telethon_msg, file=dest_path)
-                
-                # Загружаем в Immich как обычное видео
                 status, _ = await upload_file_path_to_immich(
                     dest_path, fname, msg.date, msg.message_id,
                     extra_album=tags[0] if tags and tags[0] else None,
                     fotografo=tags[1] if tags and len(tags) > 1 else None
                 )
-                
                 shutil.rmtree(job_dir)
-                
                 report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
                 await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=report, parse_mode="HTML")
                 return
-                
             except Exception as e:
                 logging.error(f"Telethon video_note download error: {e}")
                 await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 return
         
-        # Стандартное скачивание через Bot API с повторными попытками
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -601,7 +626,7 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.error(f"Ошибка скачивания video_note: {e}")
                     await msg.reply_text(f"❌ Не удалось скачать видеосообщение: {e}")
                     return
-####end new block
+                    
     if file_obj:
         if fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
             job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
@@ -636,45 +661,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Link ricevuto...</b>", parse_mode="HTML")
     success = False
-#    try:
-#        if "wetransfer.com" in url or "we.tl" in url:
-#            cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
-#            proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
-#        else:
-#            cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url] if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]) else ["wget", "-P", job_dir, url]
-#            proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
-#    except: success = False
-#    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
-#    if not success or not downloaded_files:
-#        if MYJD_USER:
-#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="⚠️ Download diretto fallito. Provo con JD...")
-#            ok, jd_msg = send_to_jdownloader(url, tags=tags)
-#            if ok: await context.bot.send_message(chat_id=msg.chat_id, text=f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
-#            else: await context.bot.send_message(chat_id=msg.chat_id, text=f"❌ Fallito: {jd_msg}", parse_mode="HTML")
-#            shutil.rmtree(job_dir); return
-#        else:
-#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="❌ Fallito."); shutil.rmtree(job_dir); return
+    
     try:
         if "wetransfer.com" in url or "we.tl" in url:
             cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
             proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
         else:
-            # Используем curl с флагами для сохранения с правильным именем файла
             if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]):
                 cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url]
             else:
-                # curl -L (следовать редиректам) -J (использовать Content-Disposition) -O (сохранить с именем из сервера)
                 cmd = ["curl", "-L", "-J", "-O", "--output-dir", job_dir, url]
             proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
     except Exception as e:
         logging.error(f"Download error: {e}")
         success = False
     
-    # Если curl не сработал, пробуем wget с content-disposition
     downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
     if not success or not downloaded_files:
         try:
-            # Альтернатива: wget с content-disposition
             cmd = ["wget", "--content-disposition", "--trust-server-names", "-P", job_dir, url]
             proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait()
             downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
@@ -682,23 +686,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    # Если всё ещё нет файлов или файлы имеют странные имена, пробуем переименовать
     downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
     for fname in downloaded_files:
         full_path = os.path.join(job_dir, fname)
-        # Если файл не имеет расширения или имеет странное имя (содержит ? или =)
         if "?" in fname or "=" in fname or not any(fname.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.mp4', '.mov']):
-            # Пробуем извлечь имя файла из URL
             import urllib.parse
             parsed = urllib.parse.urlparse(url)
             query_params = urllib.parse.parse_qs(parsed.query)
-            
-            # Ищем параметр filename в URL
             if 'filename' in query_params:
                 new_name = query_params['filename'][0]
-                # Декодируем URL-кодированные символы
                 new_name = urllib.parse.unquote(new_name)
-                # Очищаем от недопустимых символов
                 new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
                 new_path = os.path.join(job_dir, new_name)
                 try:
@@ -706,30 +703,88 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logging.info(f"Переименован файл: {fname} -> {new_name}")
                 except Exception as e:
                     logging.warning(f"Не удалось переименовать {fname}: {e}")
+                    
     stats, albums = await process_directory_content(job_dir, update.message.date, update.message.message_id, manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id)
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati (Aggiornati)"
     if albums: rep += f"\n📂 Album: {', '.join(albums)}"
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
+# --- ACTIVE-PASSIVE MAIN LOOP ---
+async def main():
+    await app.initialize()
+    await app.start()
+    
+    is_active = False
+    watch_task = None
+    
+    # Initial lock check
+    if try_acquire_lock(LOCK_FILE_PATH, INSTANCE_ID, LOCK_TIMEOUT):
+        is_active = True
+        await app.updater.start_polling()
+        watch_task = asyncio.create_task(watch_folder_task(app))
+        logging.info("🔒 Lock acquired on start. ACTIVE mode.")
+    else:
+        logging.info("⏳ Lock held by another instance. PASSIVE mode.")
+        
+    try:
+        while True:
+            await asyncio.sleep(LOCK_CHECK_INTERVAL)
+            if is_active:
+                if not maintain_lock(LOCK_FILE_PATH, INSTANCE_ID):
+                    logging.warning("🔓 Failed to maintain lock. Stopping updater. PASSIVE mode.")
+                    await app.updater.stop()
+                    is_active = False
+                    if watch_task:
+                        watch_task.cancel()
+                        try:
+                            await watch_task
+                        except asyncio.CancelledError:
+                            pass
+                        watch_task = None
+            else:
+                if try_acquire_lock(LOCK_FILE_PATH, INSTANCE_ID, LOCK_TIMEOUT):
+                    logging.info("🔒 Lock acquired. Starting updater. ACTIVE mode.")
+                    await app.updater.start_polling()
+                    watch_task = asyncio.create_task(watch_folder_task(app))
+                    is_active = True
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if is_active:
+            await app.updater.stop()
+        if watch_task and not watch_task.done():
+            watch_task.cancel()
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
+        release_lock(LOCK_FILE_PATH, INSTANCE_ID)
+        await app.stop()
+        await app.shutdown()
+
 if __name__ == "__main__":
     # Увеличиваем таймауты для работы с большими файлами
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
         connection_pool_size=8,
-        read_timeout=30.0,  # Увеличиваем до 30 секунд
+        read_timeout=30.0,
         write_timeout=30.0,
         connect_timeout=30.0,
         pool_timeout=30.0
     )
-    app = ApplicationBuilder().token(TOKEN).build()
+    
+    # ИСПРАВЛЕНИЕ: Передаем request в ApplicationBuilder
+    app = ApplicationBuilder().token(TOKEN).request(request).build()
+    
     app.add_handler(CommandHandler("tags", send_tags_menu))
     app.add_handler(CommandHandler("start", send_tags_menu))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-#    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_any_media))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-    loop = asyncio.get_event_loop(); loop.create_task(watch_folder_task(app))
-    print("Bot avviato (v42 - Photographer as Album)...")
-    app.run_polling()
+    
+    print("Bot avviato (v43 - Active-Passive HA)...")
+    
+    # Запускаем асинхронный цикл с проверкой блокировок
+    asyncio.run(main())
