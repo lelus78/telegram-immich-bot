@@ -627,7 +627,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url_m = re.search(r'(https?://\S+)', update.message.text)
     if not url_m: return
     url = url_m.group(1); tags = get_effective_tags(update.effective_user.id, update.message.text)
-    JD_DOMAINS = ["mobidrive.com", "fromsmash.com", "swisstransfer.com", "mega.nz", "drive.google.com", "dropbox.com", "1fichier.com", "filecrypt.cc", "mediafire.com", "instagram.com", "facebook.com", "fb.watch"]
+    JD_DOMAINS = ["mobidrive.com", "fromsmash.com", "swisstransfer.com", "mega.nz", "drive.google.com", "dropbox.com", "1fichier.com", "filecrypt.cc", "mediafire.com"]
     if any(d in url for d in JD_DOMAINS) or "/jd" in update.message.text:
         ok, msg = send_to_jdownloader(url, tags=tags)
         if ok: await update.message.reply_text(f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
@@ -636,24 +636,76 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Link ricevuto...</b>", parse_mode="HTML")
     success = False
+#    try:
+#        if "wetransfer.com" in url or "we.tl" in url:
+#            cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
+#            proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
+#        else:
+#            cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url] if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]) else ["wget", "-P", job_dir, url]
+#            proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
+#    except: success = False
+#    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+#    if not success or not downloaded_files:
+#        if MYJD_USER:
+#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="⚠️ Download diretto fallito. Provo con JD...")
+#            ok, jd_msg = send_to_jdownloader(url, tags=tags)
+#            if ok: await context.bot.send_message(chat_id=msg.chat_id, text=f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
+#            else: await context.bot.send_message(chat_id=msg.chat_id, text=f"❌ Fallito: {jd_msg}", parse_mode="HTML")
+#            shutil.rmtree(job_dir); return
+#        else:
+#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="❌ Fallito."); shutil.rmtree(job_dir); return
     try:
         if "wetransfer.com" in url or "we.tl" in url:
             cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
             proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
         else:
-            cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url] if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]) else ["wget", "-P", job_dir, url]
+            # Используем curl с флагами для сохранения с правильным именем файла
+            if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]):
+                cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url]
+            else:
+                # curl -L (следовать редиректам) -J (использовать Content-Disposition) -O (сохранить с именем из сервера)
+                cmd = ["curl", "-L", "-J", "-O", "--output-dir", job_dir, url]
             proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
-    except: success = False
+    except Exception as e:
+        logging.error(f"Download error: {e}")
+        success = False
+    
+    # Если curl не сработал, пробуем wget с content-disposition
     downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
     if not success or not downloaded_files:
-        if MYJD_USER:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="⚠️ Download diretto fallito. Provo con JD...")
-            ok, jd_msg = send_to_jdownloader(url, tags=tags)
-            if ok: await context.bot.send_message(chat_id=msg.chat_id, text=f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
-            else: await context.bot.send_message(chat_id=msg.chat_id, text=f"❌ Fallito: {jd_msg}", parse_mode="HTML")
-            shutil.rmtree(job_dir); return
-        else:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="❌ Fallito."); shutil.rmtree(job_dir); return
+        try:
+            # Альтернатива: wget с content-disposition
+            cmd = ["wget", "--content-disposition", "--trust-server-names", "-P", job_dir, url]
+            proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait()
+            downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+            success = len(downloaded_files) > 0
+        except:
+            pass
+    
+    # Если всё ещё нет файлов или файлы имеют странные имена, пробуем переименовать
+    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+    for fname in downloaded_files:
+        full_path = os.path.join(job_dir, fname)
+        # Если файл не имеет расширения или имеет странное имя (содержит ? или =)
+        if "?" in fname or "=" in fname or not any(fname.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.mp4', '.mov']):
+            # Пробуем извлечь имя файла из URL
+            import urllib.parse
+            parsed = urllib.parse.urlparse(url)
+            query_params = urllib.parse.parse_qs(parsed.query)
+            
+            # Ищем параметр filename в URL
+            if 'filename' in query_params:
+                new_name = query_params['filename'][0]
+                # Декодируем URL-кодированные символы
+                new_name = urllib.parse.unquote(new_name)
+                # Очищаем от недопустимых символов
+                new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
+                new_path = os.path.join(job_dir, new_name)
+                try:
+                    os.rename(full_path, new_path)
+                    logging.info(f"Переименован файл: {fname} -> {new_name}")
+                except Exception as e:
+                    logging.warning(f"Не удалось переименовать {fname}: {e}")
     stats, albums = await process_directory_content(job_dir, update.message.date, update.message.message_id, manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id)
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati (Aggiornati)"
