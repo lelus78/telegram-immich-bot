@@ -21,83 +21,33 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from telethon.tl.types import DocumentAttributeFilename
 from telethon import TelegramClient
 from telegram.request import HTTPXRequest
-import fcntl
-import signal
-import sys
-
-# --- LOCK FILE ДЛЯ ACTIVE-PASSIVE РЕЖИМА ---
-LOCK_FILE = os.path.join(os.getenv("IMPORT_DIR", ""), "bot.lock")
-lock_fd = None
-
-def acquire_lock():
-    """Пытается захватить блокировку. Возвращает True если успешно."""
-    global lock_fd
-    try:
-        lock_fd = open(LOCK_FILE, 'w')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_fd.write(str(os.getpid()))
-        lock_fd.flush()
-        logging.info(f"✅ Захвачена блокировка: {LOCK_FILE}")
-        return True
-    except (IOError, OSError) as e:
-        logging.warning(f"⚠️ Не удалось захватить блокировку (другой контейнер активен): {e}")
-        if lock_fd:
-            lock_fd.close()
-            lock_fd = None
-        return False
-
-def release_lock():
-    """Освобождает блокировку."""
-    global lock_fd
-    if lock_fd:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-            logging.info("🔓 Блокировка освобождена")
-        except:
-            pass
-        lock_fd = None
-
-def signal_handler(signum, frame):
-    """Обработчик сигналов для корректного завершения."""
-    logging.info(f"Получен сигнал {signum}, освобождаю блокировку...")
-    release_lock()
-    sys.exit(0)
-
-# Регистрируем обработчики сигналов
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
-
-# Пытаемся захватить блокировку СРАЗУ после определения констант
-if not acquire_lock():
-    logging.error("❌ Другой экземпляр бота уже активен. Завершаю работу.")
-    sys.exit(1)
 
 # Telethon config
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = "telegram_session"
 
-# Инициализация клиента Telethon (только если блокировка получена)
+# Инициализация клиента Telethon
 telethon_client = None
 if API_ID and API_HASH:
     logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
     
+    # Проверяем существование файла сессии
     session_file = f"{SESSION_NAME}.session"
     if not os.path.exists(session_file):
-        logging.error(f"❌ Файл сессии '{session_file}' не найден!")
+        logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
     else:
         try:
             telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
             
             async def init_telethon():
+                # Сначала подключаемся
                 await telethon_client.connect()
                 logging.info("✅ Telethon подключен")
                 
+                # Потом проверяем авторизацию
                 if not await telethon_client.is_user_authorized():
-                    logging.error("❌ Telethon не авторизован!")
+                    logging.error("❌ Telethon не авторизован! Файл сессии недействителен.")
                     await telethon_client.disconnect()
                     return None
                 
@@ -763,31 +713,23 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
 if __name__ == "__main__":
-    # Пытаемся захватить блокировку
-    if not acquire_lock():
-        logging.error("❌ Другой экземпляр бота уже активен. Завершаю работу.")
-        sys.exit(1)
-    
-    try:
-        # Увеличиваем таймауты для работы с большими файлами
-        from telegram.request import HTTPXRequest
-        request = HTTPXRequest(
-            connection_pool_size=8,
-            read_timeout=30.0,
-            write_timeout=30.0,
-            connect_timeout=30.0,
-            pool_timeout=30.0
-        )
-        app = ApplicationBuilder().token(TOKEN).build()
-        app.add_handler(CommandHandler("tags", send_tags_menu))
-        app.add_handler(CommandHandler("start", send_tags_menu))
-        app.add_handler(CallbackQueryHandler(callback_handler))
-        app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
-        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-        app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
-        loop = asyncio.get_event_loop()
-        loop.create_task(watch_folder_task(app))
-        print("Bot avviato (v42 - Photographer as Album)...")
-        app.run_polling()
-    finally:
-        release_lock()
+    # Увеличиваем таймауты для работы с большими файлами
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=30.0,  # Увеличиваем до 30 секунд
+        write_timeout=30.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0
+    )
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("tags", send_tags_menu))
+    app.add_handler(CommandHandler("start", send_tags_menu))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+#    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_any_media))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
+    loop = asyncio.get_event_loop(); loop.create_task(watch_folder_task(app))
+    print("Bot avviato (v42 - Photographer as Album)...")
+    app.run_polling()
