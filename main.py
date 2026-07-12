@@ -18,6 +18,98 @@ from exif import Image as ExifImage
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler, CallbackQueryHandler
+from telethon.tl.types import DocumentAttributeFilename
+from telethon import TelegramClient
+from telegram.request import HTTPXRequest
+import fcntl
+import signal
+
+# Lock file для координации между контейнерами
+LOCK_FILE = os.path.join(os.getenv("IMPORT_DIR", ""), "bot.lock")
+lock_fd = None
+
+def acquire_lock():
+    """Пытается захватить блокировку. Возвращает True если успешно."""
+    global lock_fd
+    try:
+        lock_fd = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+        logging.info(f"✅ Захвачена блокировка: {LOCK_FILE}")
+        return True
+    except (IOError, OSError) as e:
+        logging.warning(f"⚠️ Не удалось захватить блокировку (другой контейнер активен): {e}")
+        if lock_fd:
+            lock_fd.close()
+            lock_fd = None
+        return False
+
+def release_lock():
+    """Освобождает блокировку."""
+    global lock_fd
+    if lock_fd:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+            os.remove(LOCK_FILE)
+            logging.info("🔓 Блокировка освобождена")
+        except:
+            pass
+        lock_fd = None
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для корректного завершения."""
+    logging.info(f"Получен сигнал {signum}, освобождаю блокировку...")
+    release_lock()
+    sys.exit(0)
+
+# Регистрируем обработчики сигналов
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+
+# Telethon config
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SESSION_NAME = "telegram_session"
+
+# Инициализация клиента Telethon
+telethon_client = None
+if API_ID and API_HASH:
+    logging.info(f"🔧 Инициализация Telethon: API_ID={API_ID}, SESSION={SESSION_NAME}")
+    
+    # Проверяем существование файла сессии
+    session_file = f"{SESSION_NAME}.session"
+    if not os.path.exists(session_file):
+        logging.error(f"❌ Файл сессии '{session_file}' не найден! Создайте его локально и пробросьте в контейнер.")
+    else:
+        try:
+            telethon_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+            
+            async def init_telethon():
+                # Сначала подключаемся
+                await telethon_client.connect()
+                logging.info("✅ Telethon подключен")
+                
+                # Потом проверяем авторизацию
+                if not await telethon_client.is_user_authorized():
+                    logging.error("❌ Telethon не авторизован! Файл сессии недействителен.")
+                    await telethon_client.disconnect()
+                    return None
+                
+                logging.info("✅ Telethon авторизован и готов к работе")
+                return telethon_client
+            
+            loop = asyncio.get_event_loop()
+            telethon_client = loop.run_until_complete(init_telethon())
+            
+        except Exception as e:
+            logging.error(f"❌ Ошибка инициализации Telethon: {e}", exc_info=True)
+            telethon_client = None
+else:
+    logging.warning("⚠️ TELEGRAM_API_ID или TELEGRAM_API_HASH не заданы")
+
 
 # --- CONFIGURAZIONE ---
 logging.basicConfig(
@@ -269,8 +361,11 @@ async def process_directory_content(directory, msg_date, msg_id, manual_tags=Non
                     ext_to = os.path.join(root, "extracted_" + file)
                     os.makedirs(ext_to, exist_ok=True); fix_perms(ext_to)
                     try: patoolib.extract_archive(full_p, outdir=ext_to); os.remove(full_p); has_archives = True; await asyncio.sleep(5)
-                    except: total_stats["error"] += 1
-    
+#                    except: total_stats["error"] += 1
+                    except Exception as e:
+                        # Теперь вы увидите в логах, почему архив не распаковался
+                        logging.error(f"Ошибка распаковки {full_p}: {e}")
+                        total_stats["error"] += 1
     all_items = []
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in ["corrupted", "failed_extraction", "unsupported_files"]]
@@ -350,7 +445,7 @@ async def watch_folder_task(app):
             dirs[:] = [d for d in dirs if d not in special_dirs]
             for file in files:
                 if file.lower().endswith((".jpg", ".jpeg", ".png", ".heic", ".mp4", ".mov", ".avi", ".zip", ".rar", ".7z", ".tar", ".webp",
-                                          ".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raw")):
+                                          ".raf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".rw2", ".orf", ".raw", ".gz")):
                     if is_file_stable(os.path.join(root, file), wait_time=2):
                         has_valid_content = True; break
             if has_valid_content: break
@@ -442,15 +537,120 @@ async def handle_any_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message; tags = get_effective_tags(update.effective_user.id, msg.caption or "")
     used_albums = [t for t in tags if t] if tags else []
     file_obj = None; fname = "file.jpg"
+#####old part
+#    if msg.document:
+#        fname = msg.document.file_name or "file"
+#        mime = msg.document.mime_type or ""
+#        # Разрешаем скачивание, если это фото/видео ИЛИ архив
+#        if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
+#            file_obj = await msg.document.get_file()
+#####old part
+####new part
     if msg.document:
-        if "image" in (msg.document.mime_type or "") or "video" in (msg.document.mime_type or ""):
-            file_obj = await msg.document.get_file(); fname = msg.document.file_name or "file"
+        fname = msg.document.file_name or "file"
+        mime = msg.document.mime_type or ""
+        file_size = msg.document.file_size or 0
+        
+        if "image" in mime or "video" in mime or fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
+            # Если файл больше 20 МБ и Telethon настроен — используем его
+            if file_size > 20 * 1024 * 1024 and telethon_client:
+                job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}")
+                os.makedirs(job_dir, exist_ok=True)
+                dest_path = os.path.join(job_dir, fname)
+                
+                sm = await msg.reply_text("⏳ <b>Скачивание большого файла через Telethon...</b>", parse_mode="HTML")
+                
+                try:
+                    # Скачиваем файл через Telethon по message_id
+                    telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
+                    await telethon_client.download_media(telethon_msg, file=dest_path)
+                    
+                    # Дальше обрабатываем как обычный архив
+                    stats, albums = await process_directory_content(job_dir, msg.date, msg.message_id, manual_tags=tags, bot=context.bot, chat_id=msg.chat_id)
+                    shutil.rmtree(job_dir)
+                    
+                    rep = f"📦 <b>Большой архив обработан!</b>\n✅ {stats['success']} Фото\n♻️ {stats['duplicate']} Дубликатов"
+                    if albums: rep += f"\n📂 <b>Альбомы:</b> {', '.join(albums)}"
+                    await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=rep, parse_mode="HTML")
+                    return
+                    
+                except Exception as e:
+                    logging.error(f"Telethon download error: {e}")
+                    await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    return
+            
+            # Стандартное скачивание через Bot API (для файлов < 20 МБ)
+            try:
+                file_obj = await msg.document.get_file()
+            except TelegramError as e:
+                if "too big" in str(e).lower():
+                    await msg.reply_text(f"❌ Файл слишком большой ({file_size / (1024*1024):.1f} МБ). Настройте Telethon или используйте папку импорта.")
+                    return
+                raise
+
+#####new part
     elif msg.photo:
         file_obj = await msg.photo[-1].get_file(); fname = f"photo_{file_obj.file_unique_id}.jpg"
     elif msg.video:
         file_obj = await msg.video.get_file(); fname = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
+#    elif msg.video_note:  # <-- ДОБАВИТЬ ЭТО
+#        file_obj = await msg.video_note.get_file()
+#        fname = f"video_note_{file_obj.file_unique_id}.mp4"
+    elif msg.video_note:
+        file_size = msg.video_note.file_size or 0
+        
+        # Если видеосообщение большое (>20МБ) и Telethon настроен — используем его
+        if file_size > 20 * 1024 * 1024 and telethon_client:
+            job_dir = os.path.join(TEMP_DIR, f"vnote_{msg.message_id}")
+            os.makedirs(job_dir, exist_ok=True)
+            fname = f"video_note_{msg.video_note.file_unique_id}.mp4"
+            dest_path = os.path.join(job_dir, fname)
+            
+            sm = await msg.reply_text("⏳ <b>Скачивание большого видеосообщения через Telethon...</b>", parse_mode="HTML")
+            
+            try:
+                telethon_msg = await telethon_client.get_messages(msg.chat_id, ids=msg.message_id)
+                await telethon_client.download_media(telethon_msg, file=dest_path)
+                
+                # Загружаем в Immich как обычное видео
+                status, _ = await upload_file_path_to_immich(
+                    dest_path, fname, msg.date, msg.message_id,
+                    extra_album=tags[0] if tags and tags[0] else None,
+                    fotografo=tags[1] if tags and len(tags) > 1 else None
+                )
+                
+                shutil.rmtree(job_dir)
+                
+                report = "✅ Видео загружено!" if status == "success" else "♻️ Дубликат (теги обновлены)."
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=report, parse_mode="HTML")
+                return
+                
+            except Exception as e:
+                logging.error(f"Telethon video_note download error: {e}")
+                await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=sm.message_id, text=f"❌ Ошибка скачивания: {e}")
+                shutil.rmtree(job_dir, ignore_errors=True)
+                return
+        
+        # Стандартное скачивание через Bot API с повторными попытками
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                file_obj = await msg.video_note.get_file()
+                fname = f"video_note_{file_obj.file_unique_id}.mp4"
+                break
+            except TelegramError as e:
+                if "timed out" in str(e).lower() and attempt < max_retries - 1:
+                    logging.warning(f"Таймаут при скачивании video_note, попытка {attempt + 1}/{max_retries}")
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    logging.error(f"Ошибка скачивания video_note: {e}")
+                    await msg.reply_text(f"❌ Не удалось скачать видеосообщение: {e}")
+                    return
+####end new block
     if file_obj:
-        if fname.lower().endswith((".zip", ".rar", ".7z", ".tar")):
+        if fname.lower().endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
             job_dir = os.path.join(TEMP_DIR, f"zip_{msg.message_id}"); os.makedirs(job_dir, exist_ok=True)
             sm = await msg.reply_text("⏳ <b>Archivio ricevuto...</b>", parse_mode="HTML")
             await file_obj.download_to_drive(os.path.join(job_dir, fname))
@@ -474,7 +674,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url_m = re.search(r'(https?://\S+)', update.message.text)
     if not url_m: return
     url = url_m.group(1); tags = get_effective_tags(update.effective_user.id, update.message.text)
-    JD_DOMAINS = ["mobidrive.com", "fromsmash.com", "swisstransfer.com", "mega.nz", "drive.google.com", "dropbox.com", "1fichier.com", "filecrypt.cc", "mediafire.com", "instagram.com", "facebook.com", "fb.watch"]
+    JD_DOMAINS = ["mobidrive.com", "fromsmash.com", "swisstransfer.com", "mega.nz", "drive.google.com", "dropbox.com", "1fichier.com", "filecrypt.cc", "mediafire.com"]
     if any(d in url for d in JD_DOMAINS) or "/jd" in update.message.text:
         ok, msg = send_to_jdownloader(url, tags=tags)
         if ok: await update.message.reply_text(f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
@@ -483,24 +683,76 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job_dir = os.path.join(TEMP_DIR, f"job_{update.message.message_id}"); os.makedirs(job_dir, exist_ok=True)
     msg = await update.message.reply_text("⏳ <b>Link ricevuto...</b>", parse_mode="HTML")
     success = False
+#    try:
+#        if "wetransfer.com" in url or "we.tl" in url:
+#            cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
+#            proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
+#        else:
+#            cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url] if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]) else ["wget", "-P", job_dir, url]
+#            proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
+#    except: success = False
+#    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+#    if not success or not downloaded_files:
+#        if MYJD_USER:
+#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="⚠️ Download diretto fallito. Provo con JD...")
+#            ok, jd_msg = send_to_jdownloader(url, tags=tags)
+#            if ok: await context.bot.send_message(chat_id=msg.chat_id, text=f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
+#            else: await context.bot.send_message(chat_id=msg.chat_id, text=f"❌ Fallito: {jd_msg}", parse_mode="HTML")
+#            shutil.rmtree(job_dir); return
+#        else:
+#            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="❌ Fallito."); shutil.rmtree(job_dir); return
     try:
         if "wetransfer.com" in url or "we.tl" in url:
             cmd = ["python3", "/opt/transferwee/transferwee.py", "download", url]
             proc = await asyncio.create_subprocess_exec(*cmd, cwd=job_dir); await proc.wait(); success = (proc.returncode == 0)
         else:
-            cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url] if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]) else ["wget", "-P", job_dir, url]
+            # Используем curl с флагами для сохранения с правильным именем файла
+            if any(x in url for x in ["youtube", "youtu.be", "instagram", "tiktok"]):
+                cmd = ["yt-dlp", "-o", f"{job_dir}/%(title)s.%(ext)s", url]
+            else:
+                # curl -L (следовать редиректам) -J (использовать Content-Disposition) -O (сохранить с именем из сервера)
+                cmd = ["curl", "-L", "-J", "-O", "--output-dir", job_dir, url]
             proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait(); success = (proc.returncode == 0)
-    except: success = False
+    except Exception as e:
+        logging.error(f"Download error: {e}")
+        success = False
+    
+    # Если curl не сработал, пробуем wget с content-disposition
     downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
     if not success or not downloaded_files:
-        if MYJD_USER:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="⚠️ Download diretto fallito. Provo con JD...")
-            ok, jd_msg = send_to_jdownloader(url, tags=tags)
-            if ok: await context.bot.send_message(chat_id=msg.chat_id, text=f"🦅 <b>JDownloader:</b> Inviato!", parse_mode="HTML")
-            else: await context.bot.send_message(chat_id=msg.chat_id, text=f"❌ Fallito: {jd_msg}", parse_mode="HTML")
-            shutil.rmtree(job_dir); return
-        else:
-            await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text="❌ Fallito."); shutil.rmtree(job_dir); return
+        try:
+            # Альтернатива: wget с content-disposition
+            cmd = ["wget", "--content-disposition", "--trust-server-names", "-P", job_dir, url]
+            proc = await asyncio.create_subprocess_exec(*cmd); await proc.wait()
+            downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+            success = len(downloaded_files) > 0
+        except:
+            pass
+    
+    # Если всё ещё нет файлов или файлы имеют странные имена, пробуем переименовать
+    downloaded_files = [f for f in os.listdir(job_dir) if os.path.isfile(os.path.join(job_dir, f))]
+    for fname in downloaded_files:
+        full_path = os.path.join(job_dir, fname)
+        # Если файл не имеет расширения или имеет странное имя (содержит ? или =)
+        if "?" in fname or "=" in fname or not any(fname.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z', '.jpg', '.jpeg', '.png', '.mp4', '.mov']):
+            # Пробуем извлечь имя файла из URL
+            import urllib.parse
+            parsed = urllib.parse.urlparse(url)
+            query_params = urllib.parse.parse_qs(parsed.query)
+            
+            # Ищем параметр filename в URL
+            if 'filename' in query_params:
+                new_name = query_params['filename'][0]
+                # Декодируем URL-кодированные символы
+                new_name = urllib.parse.unquote(new_name)
+                # Очищаем от недопустимых символов
+                new_name = re.sub(r'[<>:"/\\|?*]', '_', new_name)
+                new_path = os.path.join(job_dir, new_name)
+                try:
+                    os.rename(full_path, new_path)
+                    logging.info(f"Переименован файл: {fname} -> {new_name}")
+                except Exception as e:
+                    logging.warning(f"Не удалось переименовать {fname}: {e}")
     stats, albums = await process_directory_content(job_dir, update.message.date, update.message.message_id, manual_tags=tags, bot=context.bot, chat_id=update.message.chat_id)
     shutil.rmtree(job_dir)
     rep = f"✅ <b>Completato!</b>\n{stats['success']} Caricati\n{stats['duplicate']} Duplicati (Aggiornati)"
@@ -508,13 +760,31 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("tags", send_tags_menu))
-    app.add_handler(CommandHandler("start", send_tags_menu))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_any_media))
-    loop = asyncio.get_event_loop(); loop.create_task(watch_folder_task(app))
-    print("Bot avviato (v42 - Photographer as Album)...")
-    app.run_polling()
+    # Пытаемся захватить блокировку
+    if not acquire_lock():
+        logging.error("❌ Другой экземпляр бота уже активен. Завершаю работу.")
+        sys.exit(1)
+    
+    try:
+        # Увеличиваем таймауты для работы с большими файлами
+        from telegram.request import HTTPXRequest
+        request = HTTPXRequest(
+            connection_pool_size=8,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            connect_timeout=30.0,
+            pool_timeout=30.0
+        )
+        app = ApplicationBuilder().token(TOKEN).build()
+        app.add_handler(CommandHandler("tags", send_tags_menu))
+        app.add_handler(CommandHandler("start", send_tags_menu))
+        app.add_handler(CallbackQueryHandler(callback_handler))
+        app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_url))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+        app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
+        loop = asyncio.get_event_loop()
+        loop.create_task(watch_folder_task(app))
+        print("Bot avviato (v42 - Photographer as Album)...")
+        app.run_polling()
+    finally:
+        release_lock()

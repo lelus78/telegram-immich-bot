@@ -5,3 +5,4 @@ exif==1.*
 patool==2.*
 yt-dlp==2024.*
 myjdapi
+telethon
