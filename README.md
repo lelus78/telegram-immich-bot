@@ -4,13 +4,12 @@ A Telegram bot that uploads photos, videos, and archives directly to your [Immic
 
 ## Features
 
-- **Upload from Telegram** — send photos, videos, or documents directly to your Immich library
+- **Upload from Telegram up to 2GB** — send photos, videos, or documents directly to your Immich library
 - **Archive extraction** — ZIP, RAR, 7z, TAR archives are automatically extracted before upload
 - **Album tagging** — use `#album <name>` in captions or messages to assign assets to a named album
 - **Photographer tagging** — use `#fotografo <name>` to tag the photographer; a dedicated album is created automatically
 - **Tag memory** — active tags are remembered for 30 minutes across multiple uploads
-- **URL download** — send a URL to download and import the file (supports `wget`, `yt-dlp`, WeTransfer)
-- **JDownloader integration** — links to Mega, Google Drive, Dropbox, Instagram, and other sites are forwarded to JDownloader automatically
+- **URL download** — send a URL to download and import the file (supports `curl`, `wget`, `yt-dlp`)
 - **Watch folder** — files dropped in the import directory are automatically imported every 30 seconds
 - **Duplicate detection** — duplicate assets are detected via SHA-1 checksum and skipped gracefully
 - **Access control** — only whitelisted Telegram user IDs can interact with the bot
@@ -20,28 +19,46 @@ A Telegram bot that uploads photos, videos, and archives directly to your [Immic
 - Docker (recommended) or Python 3.11+
 - A running [Immich](https://immich.app/) instance
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- (Optional) A [MyJDownloader](https://my.jdownloader.org/) account for remote download support
+- Telethon token (from [my.telegram.org](https://my.telegram.org/))
 
 ## Quick Start with Docker
+clone repo
+```
+git clone https://github.com/apnagaev/telegram-immich-bot.git
+```
+build container
+```
+cd telegram-immich-bot
+docker build -t immichtelebot .
+```
+
+edit telethon_session.sh, change API_ID = 1111111 and API_HASH = "11111111111111111111111"  to you ID and HASH from https://my.telegram.org/
+run
+```
+bash ./telethon_session.sh
+```
+map created telegram_session.session to docker container
 
 ```yaml
 # docker-compose.yml
-services:
-  tg-immich-bot:
-    build: .
+  telegram-immich:
+    image: immichtelebot:latest # need build
+    container_name: telegram-immich
     restart: unless-stopped
     environment:
-      TELEGRAM_TOKEN: "your-telegram-bot-token"
-      IMMICH_URL: "http://your-immich-host:2283"
-      IMMICH_API_KEY: "your-immich-api-key"
-      ALBUM_ID: "optional-default-album-id"
-      ALLOWED_USER_IDS: "123456789,987654321"
-      IMPORT_DIR: "/import"
-      MYJD_USER: "optional-myjdownloader-email"
-      MYJD_PASSWORD: "optional-myjdownloader-password"
-      MYJD_DEVICE: "jdownloader"
+      - TELEGRAM_TOKEN=bot_father_token
+      - IMMICH_URL=immich_url
+      - IMMICH_API_KEY=immich_api_key
+      - ALLOWED_USER_IDS=telegram_user_id
+      - IMPORT_DIR=/import
+      - ALBUM_ID=optional_album_id
+      - TZ=Europe/Moscow
+      - TELEGRAM_API_ID=telethone_api_id
+      - TELEGRAM_API_HASH=telethone_api_hash
     volumes:
-      - /path/to/import:/import
+      - ./telegrammal:/import
+      - ./telegram_session.session:/app/telegram_session.session
+
 ```
 
 ```bash
@@ -61,6 +78,8 @@ docker compose up -d
 | `MYJD_USER` | No | MyJDownloader account email |
 | `MYJD_PASSWORD` | No | MyJDownloader account password |
 | `MYJD_DEVICE` | No | JDownloader device name (default: `jdownloader`) |
+| `TELEGRAM_API_ID` | No | telethone API ID |
+| `TELEGRAM_API_HASH` | No | telethone HASH ID |
 
 ## Usage
 
@@ -83,11 +102,7 @@ Tags remain active for 30 minutes. Use the `/tags` command to view or change act
 
 Send a URL to download and import the content:
 
-- **Direct links / WeTransfer** — downloaded with `wget` or `transferwee`
-- **YouTube / Instagram / TikTok** — downloaded with `yt-dlp`
-- **Mega / Google Drive / Dropbox / etc.** — forwarded to JDownloader (requires `MYJD_*` variables)
-
-Append `/jd` anywhere in the message to force forwarding to JDownloader.
+- **Direct links / WeTransfer** — downloaded with `curl`, `wget` or `transferwee`
 
 ### Commands
 
@@ -116,3 +131,4 @@ Archives: `zip`, `rar`, `7z`, `tar`, `gz`
 ## License
 
 MIT
+it is fork https://github.com/lelus78/telegram-immich-bot 
