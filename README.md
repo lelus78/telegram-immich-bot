@@ -129,6 +129,6 @@ RAW: `raf`, `cr2`, `cr3`, `nef`, `arw`, `dng`, `rw2`, `orf`, `raw`
 Archives: `zip`, `rar`, `7z`, `tar`, `gz`
 
 ## License
-
-MIT
 it is fork https://github.com/lelus78/telegram-immich-bot 
+MIT
+
