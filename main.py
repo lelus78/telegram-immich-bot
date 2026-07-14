@@ -22,6 +22,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from telethon.tl.types import DocumentAttributeFilename
 from telethon import TelegramClient
 from telegram.request import HTTPXRequest
+import contextlib
+
 
 # Telethon config
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
@@ -710,6 +712,30 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if albums: rep += f"\n📂 Album: {', '.join(albums)}"
     await context.bot.edit_message_text(chat_id=msg.chat_id, message_id=msg.message_id, text=rep, parse_mode="HTML")
 
+
+# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перехватывает и смягчает логирование известных сетевых ошибок."""
+    error = context.error
+    if isinstance(error, telegram.error.Conflict):
+        logging.warning("⚠️ Telegram Conflict: другой экземпляр уже опрашивает обновления. Ожидаем стабилизации...")
+    elif isinstance(error, telegram.error.NetworkError):
+        logging.warning(f"⚠️ Сетевая ошибка Telegram: {error}. Повторная попытка будет выполнена автоматически.")
+    else:
+        logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
+
+
+# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перехватывает и смягчает логирование известных сетевых ошибок."""
+    error = context.error
+    if isinstance(error, telegram.error.Conflict):
+        logging.warning("⚠️ Telegram Conflict: другой экземпляр уже опрашивает обновления. Ожидаем стабилизации...")
+    elif isinstance(error, telegram.error.NetworkError):
+        logging.warning(f"⚠️ Сетевая ошибка Telegram: {error}. Повторная попытка будет выполнена автоматически.")
+    else:
+        logging.error("❌ Неожиданная ошибка в боте:", exc_info=error)
+
 # --- ACTIVE-PASSIVE MAIN LOOP ---
 async def main():
     await app.initialize()
@@ -718,10 +744,10 @@ async def main():
     is_active = False
     watch_task = None
     
-    # Initial lock check
+    # Начальная проверка блокировки
     if try_acquire_lock(LOCK_FILE_PATH, INSTANCE_ID, LOCK_TIMEOUT):
         is_active = True
-        await app.updater.start_polling()
+        await app.updater.start_polling(drop_pending_updates=False)
         watch_task = asyncio.create_task(watch_folder_task(app))
         logging.info("🔒 Lock acquired on start. ACTIVE mode.")
     else:
@@ -730,42 +756,59 @@ async def main():
     try:
         while True:
             await asyncio.sleep(LOCK_CHECK_INTERVAL)
+            
             if is_active:
+                # Пытаемся продлить блокировку
                 if not maintain_lock(LOCK_FILE_PATH, INSTANCE_ID):
-                    logging.warning("🔓 Failed to maintain lock. Stopping updater. PASSIVE mode.")
-                    await app.updater.stop()
+                    logging.warning("🔓 Failed to maintain lock (storage latency or takeover). Stopping updater. PASSIVE mode.")
                     is_active = False
+                    
+                    # 1. Сначала отменяем фоновые задачи
                     if watch_task:
                         watch_task.cancel()
-                        try:
+                        with contextlib.suppress(asyncio.CancelledError):
                             await watch_task
-                        except asyncio.CancelledError:
-                            pass
                         watch_task = None
+                    
+                    # 2. Останавливаем updater
+                    await app.updater.stop()
+                    
+                    # 3. КРИТИЧЕСКИ ВАЖНО: даем 3-5 секунд, чтобы запрос Long Polling 
+                    # на серверах Telegram успел завершиться и освободить сессию.
+                    # Это предотвращает ошибку "Conflict" у следующего экземпляра.
+                    await asyncio.sleep(4)
             else:
+                # Пытаемся захватить блокировку
                 if try_acquire_lock(LOCK_FILE_PATH, INSTANCE_ID, LOCK_TIMEOUT):
                     logging.info("🔒 Lock acquired. Starting updater. ACTIVE mode.")
-                    await app.updater.start_polling()
+                    
+                    # 4. КРИТИЧЕСКИ ВАЖНО: небольшая пауза перед стартом, 
+                    # чтобы убедиться, что предыдущий экземпляр полностью "отпустил" API Telegram.
+                    await asyncio.sleep(3)
+                    
+                    await app.updater.start_polling(drop_pending_updates=False)
                     watch_task = asyncio.create_task(watch_folder_task(app))
                     is_active = True
+                    
     except asyncio.CancelledError:
-        pass
+        logging.info("Main loop cancelled.")
     finally:
+        # Корректное завершение работы
         if is_active:
             await app.updater.stop()
         if watch_task and not watch_task.done():
             watch_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await watch_task
-            except asyncio.CancelledError:
-                pass
+        
         release_lock(LOCK_FILE_PATH, INSTANCE_ID)
         await app.stop()
         await app.shutdown()
+        logging.info("🛑 Bot shutdown complete.")
 
 if __name__ == "__main__":
-    # Увеличиваем таймауты для работы с большими файлами
     from telegram.request import HTTPXRequest
+    
     request = HTTPXRequest(
         connection_pool_size=8,
         read_timeout=30.0,
@@ -774,8 +817,10 @@ if __name__ == "__main__":
         pool_timeout=30.0
     )
     
-    # ИСПРАВЛЕНИЕ: Передаем request в ApplicationBuilder
     app = ApplicationBuilder().token(TOKEN).request(request).build()
+    
+    # Регистрируем наш мягкий обработчик ошибок
+    app.add_error_handler(error_handler)
     
     app.add_handler(CommandHandler("tags", send_tags_menu))
     app.add_handler(CommandHandler("start", send_tags_menu))
@@ -784,7 +829,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL, handle_any_media))
     
-    print("Bot avviato (v43 - Active-Passive HA)...")
-    
-    # Запускаем асинхронный цикл с проверкой блокировок
+    print("Bot avviato (v44 - Active-Passive HA Stabilized)...")
     asyncio.run(main())
